@@ -61,6 +61,16 @@ logger.setLevel(logging.INFO)
 # Sentinel: ``None`` is a valid cached value (LoRA not loaded).
 _LORA_REQUEST_CACHE_MISS = object()
 
+# AR recaption fields the diffusion pipeline surfaces via
+# ``OmniRequestOutput.custom_output`` and forwards to the actor for
+# teacher-forced replay.
+_AR_RECAPTION_FIELDS = (
+    "ar_prompt_token_ids",
+    "ar_generated_token_ids",
+    "ar_generated_text",
+    "ar_generated_logprobs",
+)
+
 
 def _drop_none_mapping_values(value: Any) -> Any:
     if isinstance(value, dict):
@@ -285,6 +295,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         deploy_config = getattr(args, "deploy_config", None)
         if deploy_config:
             engine_args["deploy_config"] = deploy_config
+            if not self._ar_mode:
+                # A multi-stage deploy config owns each stage's parallelism.  Drop
+                # the top-level ``--tensor-parallel-size`` (derived from
+                # ``rollout.tensor_model_parallel_size``), otherwise vllm-omni folds
+                # it into every diffusion stage and overrides the per-stage TP.
+                engine_args.pop("tensor_parallel_size", None)
 
         if self._ar_mode:
             for timeout_key in ("stage_init_timeout", "init_timeout"):
@@ -292,10 +308,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 if timeout_value is not None:
                     engine_args[timeout_key] = int(timeout_value)
             engine_args["logprobs_mode"] = getattr(self.config, "logprobs_mode", "processed_logprobs")
-            # AR mode: no diffusion pipeline. Drop None entries from
-            # compilation_config that OmniEngineArgs may leave behind.
-            if isinstance(engine_args.get("compilation_config"), dict):
-                engine_args["compilation_config"] = _drop_none_mapping_values(engine_args["compilation_config"])
         else:
             import_external_libs(self.config.external_lib)
 
@@ -327,6 +339,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                         pipeline_cls.__name__,
                     )
                     engine_args["max_num_seqs"] = 1
+
+        # Drop None entries from compilation_config (both AR and diffusion paths).
+        # ``asdict(OmniEngineArgs)`` expands the default CompilationConfig into a
+        # dict whose unset fields are None; the deploy-config path feeds that dict
+        # back through a pydantic CompilationConfig (vllm 0.27), which rejects
+        # explicit None.
+        if isinstance(engine_args.get("compilation_config"), dict):
+            engine_args["compilation_config"] = _drop_none_mapping_values(engine_args["compilation_config"])
 
         if getattr(self.config, "step_execution", False):
             engine_args["step_execution"] = True
@@ -432,6 +452,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         prompt_mask: torch.BoolTensor | None = None,
         extra_prompt_ids: Optional[dict[str, list[int]]] = None,
         negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
+        prompt_text: Optional[str] = None,
+        use_system_prompt: Optional[str] = None,
         priority: int = 0,
     ) -> DiffusionOutput | TokenOutput:
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -447,6 +469,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             mm_processor_kwargs,
             extra_prompt_ids,
             negative_extra_prompt_ids,
+            prompt_text,
+            use_system_prompt,
         )
         final_res = await self._run_generation(prompt, params, request_id, lora_request, priority)
         return self._process_output(final_res, params, sampling_params)
@@ -529,6 +553,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         extra_prompt_ids: Optional[dict[str, list[int]]] = None,
         negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
+        prompt_text: Optional[str] = None,
+        use_system_prompt: Optional[str] = None,
     ):
         """Build the engine prompt + sampling params for the active mode.
 
@@ -589,6 +615,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             custom_prompt["modalities"] = ["image"]
         if negative_prompt_ids is not None:
             custom_prompt["negative_prompt_ids"] = negative_prompt_ids
+        # Forwarded verbatim so the AR->DiT bridge (``ar2diffusion``) rebuilds
+        # the same chat prefix the AR stage prefilled with.
+        if prompt_text is not None:
+            custom_prompt["prompt"] = prompt_text
+        if use_system_prompt is not None:
+            custom_prompt["use_system_prompt"] = use_system_prompt
         # Per-text-encoder token ids for multi-encoder models (e.g. SD3.5),
         # produced by the agent loop so pipelines never decode/re-encode text.
         if extra_prompt_ids is not None:
@@ -749,6 +781,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 if key in extra_fields:
                     raise ValueError(f"Duplicate rollout metadata field: {key}")
                 extra_fields[key] = _maybe_unbatch(value)
+        custom_output = final_res.custom_output or {}
+        for key in _AR_RECAPTION_FIELDS:
+            if key in custom_output:
+                if key in extra_fields:
+                    raise ValueError(f"Duplicate rollout metadata field: {key}")
+                extra_fields[key] = custom_output[key]
         if rollout_audio is not None:
             extra_fields["audio"] = _maybe_unbatch(rollout_audio)
             extra_fields.setdefault("audio_sample_rate", 32000)

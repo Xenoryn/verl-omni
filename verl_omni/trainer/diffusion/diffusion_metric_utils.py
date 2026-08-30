@@ -15,11 +15,12 @@
 Metrics for diffusion (image generation) training.
 """
 
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
 from verl import DataProto
+from verl.utils import tensordict_utils as tu
 
 
 def compute_data_metrics_diffusion(batch: DataProto) -> dict[str, Any]:
@@ -134,13 +135,58 @@ def compute_timing_metrics_diffusion(timing_raw: dict[str, float], num_images: i
     }
 
 
-def compute_throughput_metrics_diffusion(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
+def _iter_prompt_token_ids(batch: DataProto):
+    """Yield per-row token-id sequences from ``batch.non_tensor_batch['prompt_token_ids']``.
+
+    Returns ``None`` if the field is not present. Rows may be numpy arrays,
+    tensors, plain lists, or wrapped in ``NonTensorData`` — normalise to a
+    ``numpy.ndarray[int64]`` for downstream counting.
+    """
+    field = batch.non_tensor_batch.get("prompt_token_ids", None) if hasattr(batch, "non_tensor_batch") else None
+    if field is None:
+        return None
+    rows = []
+    for i in range(len(field)):
+        row = tu.unwrap_non_tensor_data(field[i])
+        if isinstance(row, torch.Tensor):
+            row = row.detach().cpu().numpy()
+        rows.append(np.asarray(row, dtype=np.int64))
+    return rows
+
+
+def _iter_ar_response_lengths(batch: DataProto) -> Optional[np.ndarray]:
+    """Per-sample AR response lengths; ``None`` when the field is absent."""
+    field = batch.non_tensor_batch.get("ar_generated_token_ids", None) if hasattr(batch, "non_tensor_batch") else None
+    if field is None:
+        return None
+    lengths: list[int] = []
+    for i in range(len(field)):
+        row = tu.unwrap_non_tensor_data(field[i])
+        if isinstance(row, torch.Tensor):
+            lengths.append(int(row.numel()))
+        else:
+            lengths.append(int(len(row)))
+    return np.asarray(lengths, dtype=np.int64)
+
+
+def compute_throughput_metrics_diffusion(
+    batch: DataProto,
+    timing_raw: dict[str, float],
+    n_gpus: int,
+) -> dict[str, Any]:
     """
     Computes throughput metrics for diffusion (image/video generation) training.
 
-    Unlike language model training where throughput is measured in tokens/sec,
-    diffusion training generates images, so throughput is reported as images
-    per second.
+    Headline throughput is images/sec.  Unified AR+diffusion models (e.g.
+    HunyuanImage-3) also burn a tokenised sequence through the transformer, so
+    token metrics are reported too when ``prompt_token_ids`` is on the batch:
+
+    * ``perf/total_num_tokens`` — the full interleaved sequence length summed
+      over the batch. Matches what the actor forward propagates through.
+    * ``perf/ar_response_len_{mean,std,min,max}`` — per-sample length of the
+      newly generated AR response (``ar_generated_token_ids`` in the batch,
+      populated only by the HunyuanImage-3 unified rollout). The distribution
+      catches truncation and unbalanced trajectory lengths.
 
     Args:
         batch: A DataProto object containing diffusion batch data.
@@ -153,17 +199,35 @@ def compute_throughput_metrics_diffusion(batch: DataProto, timing_raw: dict[str,
             - perf/total_num_images: Number of images processed in the batch
             - perf/time_per_step: Time taken for the step in seconds
             - perf/throughput: Images generated per second per GPU
+            - perf/total_num_tokens: Total tokens in the batch's ``prompt_token_ids``
+              (only when the field is present).
+            - perf/tokens_per_sec: Token throughput per GPU.
     """
     if "advantages" in batch.batch:
         batch_size = batch.batch["advantages"].shape[0]
     else:
         batch_size = batch.batch["sample_level_rewards"].shape[0]
     time = timing_raw["step"]
-    return {
+    metrics: dict[str, Any] = {
         "perf/total_num_images": batch_size,
         "perf/time_per_step": time,
         "perf/throughput": batch_size / (time * n_gpus),
     }
+
+    rows = _iter_prompt_token_ids(batch)
+    if rows is not None:
+        total_tokens = int(sum(row.size for row in rows))
+        metrics["perf/total_num_tokens"] = total_tokens
+        metrics["perf/tokens_per_sec"] = total_tokens / (time * n_gpus)
+
+    ar_lens = _iter_ar_response_lengths(batch)
+    if ar_lens is not None and ar_lens.size > 0:
+        metrics["perf/ar_response_len_mean"] = float(ar_lens.mean())
+        metrics["perf/ar_response_len_std"] = float(ar_lens.std())
+        metrics["perf/ar_response_len_min"] = int(ar_lens.min())
+        metrics["perf/ar_response_len_max"] = int(ar_lens.max())
+
+    return metrics
 
 
 def compute_reward_extra_metrics_diffusion(reward_extra_infos_dict: dict) -> dict[str, Any]:
